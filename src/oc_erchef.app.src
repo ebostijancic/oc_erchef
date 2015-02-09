@@ -43,7 +43,10 @@
                   tools,
                   uuid,
                   webtool,
-                  wx
+                  %% TODO any provision for dev-time only apps?
+                  %% And/or any harm in leaving this here since these apps arent' started by default?
+                  sync,
+                  mixer
                  ]},
   {mod, { oc_erchef_app, []}},
   {env, []}
