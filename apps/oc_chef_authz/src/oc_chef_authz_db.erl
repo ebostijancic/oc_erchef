@@ -25,10 +25,9 @@
 
 -include("../../include/oc_chef_types.hrl").
 
--export([container_record_to_authz_id/2,
-         fetch_container/3,
+-export([fetch_container/3,
          make_global_admin_group_name/1,
-         fetch_global_group_authz_id/3,
+         fetch_global_admins_authz_id/2,
          fetch_group_authz_id/3,
          fetch_group_sql/3,
          make_context/2,
@@ -242,11 +241,7 @@ statements(pgsql) ->
 
 -spec make_context(binary(), term()) -> #oc_chef_authz_context{}.
 make_context(ReqId, Darklaunch) when is_binary(ReqId) ->
-    Host = envy:get(oc_chef_authz, couchdb_host, string),
-    Port = envy:get(oc_chef_authz, couchdb_port, pos_integer),
-    S = couchbeam:server_connection(Host, Port, "", []),
     #oc_chef_authz_context{reqid = ReqId,
-                           otto_connection = S,
                            darklaunch = Darklaunch}.
 
 -spec fetch_container(oc_chef_authz_context(),
@@ -254,183 +249,13 @@ make_context(ReqId, Darklaunch) when is_binary(ReqId) ->
                       container_name()) -> #chef_container{} |
                                            not_found |
                                            {error, _}.
-fetch_container(#oc_chef_authz_context{otto_connection = Server,
-                                       darklaunch = Darklaunch} = Ctx,
+fetch_container(#oc_chef_authz_context{darklaunch = Darklaunch} = Ctx,
                 undefined, ContainerName) ->
     %% Containers withm no org are global containers -
     %% global containers are related to organizations, so we'll trigger
     %% whether the global containersa are in sql depending on where the orgs are
-    case xdarklaunch_req:is_enabled(<<"couchdb_organizations">>, Darklaunch) of
-        true ->
-            fetch_container_couchdb(Server, undefined, ContainerName);
-        false ->
-            fetch_container_sql(Ctx, ?GLOBAL_PLACEHOLDER_ORG_ID, ContainerName)
-    end;
-fetch_container(#oc_chef_authz_context{otto_connection=Server,
-                                       darklaunch = Darklaunch} = Ctx,
-                OrgId, ContainerName) ->
-    case xdarklaunch_req:is_enabled(<<"couchdb_containers">>, Darklaunch) of
-        true ->
-            fetch_container_couchdb(Server, OrgId, ContainerName);
-        false ->
-            fetch_container_sql(Ctx, OrgId, ContainerName)
-    end.
-
-make_global_admin_group_name(OrgName) ->
-  lists:flatten(io_lib:format("~s_global_admins", [OrgName])).
-
-%% TODO: the only global groups are global admins groups and this should only be used for those
-fetch_global_group_authz_id(#oc_chef_authz_context{otto_connection=Server, darklaunch = Darklaunch} = Ctx,
-                            OrgName, GroupName) ->
-    RealGroupName = lists:flatten(io_lib:format("~s_~s", [OrgName, GroupName])),
-    %% global admins are strictly related to organizations, so we'll trigger
-    %% whether the global admins group is in sql depending on where the org is
-    case xdarklaunch_req:is_enabled(<<"couchdb_organizations">>, Darklaunch) of
-        true ->
-            fetch_group_authz_id_couchdb(Server, undefined, RealGroupName);
-        false ->
-            fetch_group_authz_id_sql(Ctx, ?GLOBAL_PLACEHOLDER_ORG_ID, RealGroupName)
-    end.
-
-fetch_container_couchdb(Server, OrgId, ContainerName) ->
-    case fetch_by_name(Server, OrgId, ContainerName, authz_container) of
-        {ok, Container} ->
-            Id = ej:get({<<"_id">>}, Container),
-            AuthzId = fetch_auth_join_id(Server, Id, user_to_auth),
-            Name = ej:get({<<"containername">>}, Container),
-            Path = ej:get({<<"containerpath">>}, Container),
-            Updated =  ej:get({<<"requester_id">>}, Container),
-            #chef_container{id = Id,
-                            authz_id = AuthzId,
-                            org_id = OrgId,
-                            name = Name,
-                            path = Path,
-                            last_updated_by = Updated
-                           };
-        {not_found, _} ->
-            not_found
-    end.
-
-%% @doc Retrieve the authz ID for a given group in an organaization.
-%%
-%% This is not `fetch_group`, because currently, we have no need for
-%% complete group "objects" in the system.  This is only really used
-%% to retrieve the clients group, so that we may add newly-created
-%% clients to it (we could also start deleting clients from it, too).
--spec fetch_group_authz_id(Context :: oc_chef_authz_context(),
-                           OrgId :: binary() | undefined,
-                           GroupName :: binary()) ->  object_id() |
-                                                      {not_found, authz_group}.
-fetch_group_authz_id(#oc_chef_authz_context{otto_connection=Server,
-                                            darklaunch = Darklaunch} = Ctx,
-                     OrgId, GroupName) ->
-    case xdarklaunch_req:is_enabled(<<"couchdb_groups">>, Darklaunch) of
-        true ->
-            fetch_group_authz_id_couchdb(Server, OrgId, GroupName);
-        false ->
-            fetch_group_authz_id_sql(Ctx, OrgId, GroupName)
-    end.
-
-fetch_group_authz_id_couchdb(Server, OrgId, GroupName) ->
-    case fetch_by_name(Server, OrgId, GroupName, authz_group) of
-        {ok, Group} ->
-            Id = ej:get({<<"_id">>}, Group),
-            AuthzId = fetch_auth_join_id(Server, Id, user_to_auth),
-            AuthzId;
-        {not_found, authz_group} ->
-            {not_found, authz_group}
-    end.
-
--spec container_record_to_authz_id(any(), any()) -> object_id().
-container_record_to_authz_id(#oc_chef_authz_context{}, #chef_container{authz_id = Id}) ->
-    Id.
-
--spec fetch_by_name(couchbeam:server(),
-                    binary() | 'not_found' | undefined,
-                    binary() | string(),
-                    authz_type() | atom()) ->
-                           {ok, [{binary(), _}]} | {'not_found', atom() | 'org'}.
-%% @doc Fetch from the mixlib-authz records in couchdb
-%%
-fetch_by_name(_Server, not_found, _Name, _Type) ->
-    {not_found, org};
-fetch_by_name(Server, OrgId, Name, Type) when is_list(Name) ->
-    fetch_by_name(Server, OrgId, list_to_binary(Name), Type);
-fetch_by_name(Server, OrgId, Name, Type) when is_binary(Name) andalso (is_binary(OrgId)
-                                                                       orelse OrgId =:= undefined) ->
-    {Design, ViewName} = design_and_view_for_type(Type),
-    ChefDb = dbname(OrgId),
-    {ok, Db} = couchbeam:open_db(Server, ChefDb, []),
-    {ok, View} = couchbeam:view(Db, {Design, ViewName}, [{key, Name}]),
-    case couchbeam_view:first(View) of
-        {ok, {Row}} ->
-            Id = ?gv(<<"id">>, Row),
-            case couchbeam:open_doc(Db, Id) of
-                {error, not_found} -> {not_found, Type};
-                %% FIXME: why are we unpacking the ejson format?
-                {ok, {Doc}} -> {ok, Doc}
-            end;
-        {ok, []} -> {not_found, Type};
-        {error, not_found} -> {not_found, Type}
-    end.
-
--spec fetch_auth_join_id(couchbeam:server(), db_key(), auth_to_user|user_to_auth) -> binary() | {not_found, term()}.
-fetch_auth_join_id(Server, Id, Direction) when is_list(Id) ->
-    fetch_auth_join_id(Server, list_to_binary(Id), Direction);
-fetch_auth_join_id(Server, Id, Direction) when is_binary(Id) ->
-    {FieldName, ViewName} =
-        case Direction of
-%%            auth_to_user -> { <<"user_object_id">>, "by_auth_object_id"};
-            user_to_auth -> { <<"auth_object_id">>, "by_user_object_id"}
-        end,
-    {ok, Db} = couchbeam:open_db(Server, ?auth_join_db, []),
-    {ok, View} = couchbeam:view(Db, {?mixlib_auth_join_design, ViewName},
-                                [{key, Id}, {include_docs, true}]),
-    case couchbeam_view:first(View) of
-        {ok, []} -> {not_found, missing};
-        {ok, Row} -> ej:get({<<"doc">>, FieldName}, Row);
-        Why -> {not_found, Why}
-    end.
-
-%% @doc Return the CouchDB design doc and view name for `Type`
-%%
-%% design_and_view_for_type(authz_client) ->
-%%     {?mixlib_auth_client_design, "by_clientname"};
-design_and_view_for_type(authz_container) ->
-    {?mixlib_auth_container_design, "by_containername"};
-design_and_view_for_type(authz_group) ->
-    {?mixlib_auth_group_design, "by_groupname"}.
-%% design_and_view_for_type(authz_node) ->
-%%     {?mixlib_auth_node_design, "by_name"};
-%% design_and_view_for_type(authz_role) ->
-%%     {?mixlib_auth_role_design, "by_name"};
-%% design_and_view_for_type(AppType) ->
-%%     design_and_view_for_app_type(AppType).
-
-%% design_and_view_for_app_type(chef_client) ->
-%%     {?client_design, "all_id"};
-%% design_and_view_for_app_type(chef_data_bag) ->
-%%     {?data_bag_design, "all_id"};
-%% design_and_view_for_app_type(chef_data_bag_item) ->
-%%     {?data_bag_item_design, "all_id"};
-%% design_and_view_for_app_type(chef_environment) ->
-%%     {?environment_design, "all_id"};
-%% design_and_view_for_app_type(chef_node) ->
-%%     {?node_design, "all_id"};
-%% design_and_view_for_app_type(chef_role) ->
-%%     {?role_design, "all_id"}.
-
--spec dbname(binary()|undefined) -> <<_:40,_:_*8>>.
-% If org id is not provided, then the DB returned is the account db.
-dbname(undefined) ->
-    <<"opscode_account">>;
-dbname(OrgId) ->
-    <<"chef_", OrgId/binary>>.
-
--spec fetch_container_sql(#oc_chef_authz_context{}, binary(), binary()) -> #chef_container{} |
-                                                                           not_found |
-                                                                           {error, _}.
-fetch_container_sql(#oc_chef_authz_context{reqid = ReqId}, OrgId, Name) ->
+    fetch_container(Ctx, ?GLOBAL_PLACEHOLDER_ORG_ID, ContainerName);
+fetch_container(#oc_chef_authz_context{reqid = ReqId}, OrgId, Name) ->
     %% since ?FIRST uses record_info, it can't be placed within the fun.
     Transform = ?FIRST(chef_container),
     case stats_hero:ctime(ReqId,
@@ -446,28 +271,29 @@ fetch_container_sql(#oc_chef_authz_context{reqid = ReqId}, OrgId, Name) ->
         {error, Error} ->
             {error, Error}
     end.
--spec fetch_group_authz_id_sql(Context :: oc_chef_authz_context(),
-                               OrgId :: binary(),
-                               GroupName :: binary()) ->  object_id() |
-                                                          {not_found, authz_group} |
-                                                          {error, _}.
-fetch_group_authz_id_sql(#oc_chef_authz_context{reqid = ReqId}, OrgId, Name) ->
-    %% since ?FIRST uses record_info, it can't be placed within the fun.
-    case stats_hero:ctime(ReqId, {chef_sql, fetch},
-                          fun() ->
-                                  chef_object:default_fetch(#oc_chef_group{
-                                                    org_id = OrgId,
-                                                    name = Name},
-                                                    fun chef_sql:select_rows/1)
-                          end) of
-        #oc_chef_group{authz_id = AuthzId} ->
-            AuthzId;
-        not_found ->
-            {not_found, authz_group};
-        {error, _} = Error ->
-            Error
-    end.
 
+make_global_admin_group_name(OrgName) ->
+  lists:flatten(io_lib:format("~s_global_admins", [OrgName])).
+
+fetch_global_admins_authz_id(#oc_chef_authz_context{} = Ctx, OrgName) ->
+    #oc_chef_group{authz_id = AuthzId} = fetch_global_admins(Ctx, OrgName),
+    AuthzId.
+
+%% @doc Retrieve the authz ID for a given group in an organaization.
+%%
+%% This is not `fetch_group`, because currently, we have no need for
+%% complete group "objects" in the system.  This is only really used
+%% to retrieve the clients group, so that we may add newly-created
+%% clients to it (we could also start deleting clients from it, too).
+-spec fetch_group_authz_id(Context :: oc_chef_authz_context(),
+                           OrgId :: binary() | undefined,
+                           GroupName :: binary()) ->  object_id() |
+                                                      {not_found, authz_group}.
+fetch_group_authz_id(#oc_chef_authz_context{darklaunch = Darklaunch} = Ctx,
+                     OrgId, GroupName) ->
+    %% since ?FIRST uses record_info, it can't be placed within the fun.
+    #oc_chef_group{authz_id = AuthzId} = fetch_group_sql(Ctx, OrgId, GroupName),
+    AuthzId.
 
 %% TODO: refactor, clean this up
 %% We need a clean api for fetching a group w/o expansion of members

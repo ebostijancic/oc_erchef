@@ -252,7 +252,7 @@ provision_add_usag_to_org_users(Error, _Context) ->
 
 provision_fetch_org_global_admins(ok, #context{org_name = OrgName,
                                         authz_context = AuthzContext } = Context) ->
-    Result = oc_chef_authz_db:fetch_global_group_authz_id(AuthzContext, OrgName, "global_admins"),
+    Result = oc_chef_authz_db:fetch_global_admins_authz_id(AuthzContext, OrgName),
     provision_add_user_ace_to_global_admins(Result, Context);
 provision_fetch_org_global_admins(Error, _Context) ->
     {error, {add_usag_to_org_users_group_failed, Error}}.
